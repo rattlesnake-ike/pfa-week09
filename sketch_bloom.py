@@ -82,8 +82,7 @@ def add_cap(vertices,faces,ring,style):
         faces.append(list(ring)); return
     center=len(vertices)
     vertices.append(tuple(sum(vertices[i][k] for i in ring)/len(ring) for k in (0,1,2)))
-    if style=='Quad fan • convex':
-        if len(ring)%2: raise ValueError('Quad fans need an even boundary count.')
+    if style=='Quad fan • convex' and len(ring)%2==0:
         for i in range(0,len(ring),2): faces.append([center,ring[i],ring[(i+1)%len(ring)],ring[(i+2)%len(ring)]])
     else:
         for i in range(len(ring)): faces.append([center,ring[i],ring[(i+1)%len(ring)]])
@@ -912,7 +911,7 @@ class LiveStrokeTool:
                         except Exception:
                             if node and cmds.objExists(node): cmds.delete(node)
                             raise
-                    self.owner.register_object(node)
+                    self.owner.register_object(node); self.owner.queue_quads(node)
                     self.owner.viewport_strokes.append(cmds.ls(node,uuid=True)[0])
                     actual=' • {:,} faces'.format(cmds.polyEvaluate(node,face=True)) if shapes else ' • editable curve'
                     self.owner.status.setText('Created '+node+actual+'. '+finish_note+' Click an older object in Select mode to edit it.')
@@ -946,6 +945,7 @@ class BloomPro(QtWidgets.QDialog):
         self.window_before_fullscreen=None
         self.preview=None; self.previews={}; self.preview_inputs={}; self.preview_busy=False; self.created_nodes=[]; self.scene_pickers=[]; self.scene_stats_labels=[]; self.paintable_shapes=[]; self.surface_labels=[]; self.views=[]; self.retopo_source=None; self.dirty=False; self.live_tool=LiveStrokeTool(self)
         self.scene_nodes={}; self.live_signatures={}; self.hidden_live={}; self.viewport_strokes=[]; self.last_edit=0
+        self.quad_queue={}; self.quads_busy=False
         self.setStyleSheet('''
             QDialog {background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #F3FAFF,stop:1 #FFF9E9);}
             QWidget {color:#243D58;font-family:Segoe UI;font-size:13px;}
@@ -1027,7 +1027,7 @@ class BloomPro(QtWidgets.QDialog):
             scroll=QtWidgets.QScrollArea(); scroll.setWidgetResizable(True); scroll.setMinimumSize(0,0)
             panel=QtWidgets.QWidget(); side=QtWidgets.QVBoxLayout(panel); scroll.setWidget(panel)
             self.group(side,'Tools',[('Draw as',self.mirror_control(self.live_output)),('Size',self.mirror_control(self.brush_size)),('Thickness',self.mirror_control(self.depth)),('',self.button('✿ Fill selected object',self.fill_selected)),('',self.button('Move',lambda:self.scene_transform('moveSuperContext'))),('',self.button('Edit points',self.edit_active_points)),('',self.button('Use selected surface',self.set_paintable)),('',self.mirror_control(self.live_surface)),('',self.button('Clear surface',self.clear_paintable)),('',self.button('Clear Canvas ✿',self.clear_canvas))])
-            self.group(side,'Mesh finish',[('Subdivision',self.mirror_control(self.subdivision)),('Roundness',self.mirror_control(self.rounding)),('Target faces ≈',self.mirror_control(self.face_target)),('',self.mirror_control(self.use_face_target))])
+            self.group(side,'Mesh finish',[('Subdivision',self.mirror_control(self.subdivision)),('Roundness',self.mirror_control(self.rounding)),('Target faces ≈',self.mirror_control(self.face_target)),('',self.mirror_control(self.use_face_target)),('',self.mirror_control(self.auto_quads))])
             stats=QtWidgets.QLabel('Click a mesh to see its actual polygon count.'); stats.setWordWrap(True); self.scene_stats_labels.append(stats); side.addWidget(stats); side.addStretch()
             view.content.addWidget(scroll); view.content.setSizes([760,300])
     def active_view(self):
@@ -1114,8 +1114,10 @@ class BloomPro(QtWidgets.QDialog):
         self.resolution=self.integer(8,1024,96); self.depth_segments=self.integer(1,128,1)
         self.radius=self.number(.001,100,.12); self.brush_size=self.number(.002,200,.24)
         self.brush_size.valueChanged.connect(lambda value:self.radius.setValue(value/2)); self.radius.valueChanged.connect(lambda value:self.brush_size.setValue(value*2))
-        self.tube_sides=self.integer(3,64,12); self.caps=self.combo(['Triangles','Quads • subdivided','N-gons','Open'])
+        self.tube_sides=self.integer(3,64,12); self.caps=self.combo(['Quad fan • convex','Triangles','Quads • subdivided','N-gons','Open'])
         self.face_target=self.integer(100,1000000,5000); self.use_face_target=QtWidgets.QCheckBox('Retopologize new meshes')
+        self.auto_quads=QtWidgets.QCheckBox('Quads when a drawing is finished'); self.auto_quads.setChecked(True)
+        self.auto_quads.setToolTip('About a second after you stop drawing, filled shapes are rebuilt as all quads with Maya retopology (1 to 4 seconds each). Tubes get quad caps at once. Turn off for instant results.')
         self.subdivision=self.integer(0,4,0); self.rounding=self.number(0,1,0); self.live_preview=QtWidgets.QCheckBox('Live drawing'); self.live_preview.setChecked(True)
         self.live_preview.setToolTip('Drawing and edits update Maya automatically. Preview stays lightweight while dragging; subdivision applies on release.')
         self.mode.currentTextChanged.connect(self.change_mode); self.stroke_picker.currentIndexChanged.connect(self.choose_stroke); self.closed.toggled.connect(self.close_stroke)
@@ -1129,7 +1131,7 @@ class BloomPro(QtWidgets.QDialog):
         self.shape_layers=self.depth_segments; self.shape_target=self.face_target
         self.shape_use_target=self.use_face_target; self.shape_use_target.setText('Aim for polygon count')
         self.shape_counts=QtWidgets.QLabel('Add or click a shape to see its polygon count.'); self.shape_counts.setWordWrap(True)
-        self.group(controls,'Brush & tool polygons',[('Path samples',self.resolution),('Tube sides',self.tube_sides),('Subdivision levels',self.shape_subdivision),('Roundness 0–1',self.shape_roundness),('Depth segments',self.shape_layers),('Target faces ≈',self.shape_target),('',self.shape_use_target),('',self.shape_counts),('',self.button('Subdivide selected Maya copy',self.subdivide_shape_copy))])
+        self.group(controls,'Brush & tool polygons',[('Path samples',self.resolution),('Tube sides',self.tube_sides),('Subdivision levels',self.shape_subdivision),('Roundness 0–1',self.shape_roundness),('Depth segments',self.shape_layers),('Target faces ≈',self.shape_target),('',self.shape_use_target),('',self.auto_quads),('',self.shape_counts),('',self.button('Subdivide selected Maya copy',self.subdivide_shape_copy))])
         for widget in [self.shape_subdivision,self.shape_roundness,self.shape_layers,self.shape_target,self.resolution,self.tube_sides,self.radius,self.depth,self.width_units]: widget.valueChanged.connect(self.shape_settings_changed)
         self.caps.currentIndexChanged.connect(self.shape_settings_changed); self.plane.currentIndexChanged.connect(self.shape_settings_changed)
         self.shape_use_target.toggled.connect(self.shape_settings_changed)
@@ -1243,7 +1245,7 @@ class BloomPro(QtWidgets.QDialog):
                     points=[tuple(cmds.pointPosition(cv,world=True)) for cv in cmds.ls(curves[0]+'.cv[*]',flatten=True)]
                 if curves: points=[tuple(cmds.pointPosition(cv,world=True)) for cv in cmds.ls(curves[0]+'.cv[*]',flatten=True)]
                 result=self.create_persistent_mesh(filled_geometry(points,normal,self.depth.value(),self.depth_segments.value(),self.caps.currentText()),'bloomFilled#')
-                self.register_object(result); cmds.select(result,replace=True); self.status.setText('Created a filled solid from the selected outline. Original kept.')
+                self.register_object(result); self.queue_quads(result); cmds.select(result,replace=True); self.status.setText('Created a filled solid from the selected outline. Original kept.')
             except Exception as error: self.status.setText('Fill: '+str(error))
             return
         if not self.canvas.current():
@@ -1369,6 +1371,7 @@ class BloomPro(QtWidgets.QDialog):
                     if not cmds.objExists(node+'.bloomStrokeData'): cmds.addAttr(node,longName='bloomStrokeData',dataType='string')
                     cmds.setAttr(node+'.bloomStrokeData',json.dumps(metadata),type='string')
                 self.scene_nodes[key]=cmds.ls(node,uuid=True)[0]
+            if geometry: self.queue_quads(node)
             return node
         finally:
             with transient():
@@ -1618,6 +1621,7 @@ class BloomPro(QtWidgets.QDialog):
             self.status.setText('Click a vertex or curve control point, then press W to move it. Select / Edit returns to objects.')
         except Exception as error: self.status.setText(str(error))
     def update_selection_stats(self):
+        self.run_quad_queue()
         try:
             mesh,_=selected_mesh(); text='Selected: {}\n{:,} faces • {:,} vertices'.format(mesh.split('|')[-1],cmds.polyEvaluate(mesh,face=True),cmds.polyEvaluate(mesh,vertex=True))
         except Exception: text='Select a mesh to see its actual face count.'
@@ -1648,6 +1652,69 @@ class BloomPro(QtWidgets.QDialog):
         uid=picker.currentData(); nodes=cmds.ls(uid,long=True) if uid else []
         if not nodes: self.status.setText('Choose an existing object or refresh the list.'); return
         self.select_edit(); make_editable(nodes[0]); cmds.select(nodes[0],replace=True)
+    def quad_share(self,node):
+        selection=om.MSelectionList(); selection.add(node); path=selection.getDagPath(0); path.extendToShape()
+        counts,_=om.MFnMesh(path).getVertices()
+        return sum(1 for count in counts if count==4)/max(1,len(counts))
+    def even_triangles(self,node,size):
+        # Maya retopology is slow on the long thin triangles a filled drawing is made of
+        # (58 s on the Heart shape); on even triangles the same job takes 1 to 4 s.
+        cmds.polyTriangulate(node,constructionHistory=False)
+        cmds.polyRemesh(node,maxEdgeLength=size/10,useRelativeValues=False,constructionHistory=False)
+    def retopo_checked(self,node,target):
+        """Retopologize a copy and check it. polyRetopo can hand a mesh back unchanged
+        (a 26-face star at target 400 did), or pull the outline in, so the copy only
+        counts when it is all quads and still the same size. Returns the copy or None."""
+        area=cmds.polyEvaluate(node,worldArea=True); box=cmds.exactWorldBoundingBox(node)
+        size=max(box[3]-box[0],box[4]-box[1],box[5]-box[2],1e-6)
+        for goal in (target,int(target*1.6)):
+            work=cmds.duplicate(node,returnRootsOnly=True,name='bloomQuadWork#')[0]
+            try:
+                cmds.delete(work,constructionHistory=True); self.even_triangles(work,size)
+                cmds.polyRetopo(work,targetFaceCount=goal,preserveHardEdges=True,constructionHistory=False)
+                new=cmds.exactWorldBoundingBox(work)
+                if self.quad_share(work)==1 and abs(cmds.polyEvaluate(work,worldArea=True)/area-1)<.04 and max(abs(a-b) for a,b in zip(new,box))<.03*size: return work
+            except Exception: pass
+            if cmds.objExists(work): cmds.delete(work)
+        return None
+    def queue_quads(self,node):
+        if self.auto_quads.isChecked() and not self.quads_busy and self.has_mesh(node): self.quad_queue[cmds.ls(node,uuid=True)[0]]=time.monotonic()
+    def run_quad_queue(self):
+        # Runs from the 0.6 s selection timer, one drawing at a time, only at rest.
+        if not self.quad_queue or self.quads_busy or self.preview_busy or self.dirty: return
+        if self.canvas.drawing or self.canvas.dragging or self.canvas.moving_stroke or self.live_tool.points or any(view.input_active for view in self.views): return
+        uid,stamp=next(iter(self.quad_queue.items()))
+        if time.monotonic()-max(stamp,self.last_edit)<1.0: return
+        self.quad_queue.pop(uid); nodes=cmds.ls(uid,long=True) or []
+        if nodes and self.auto_quads.isChecked(): self.make_quads(nodes[0])
+    def make_quads(self,node):
+        """Quads by default (class critique 1:18, 1:20): swap a finished drawing's mesh for an all-quad one."""
+        if not self.has_mesh(node) or self.quad_share(node)==1: return False
+        if cmds.objExists(node+'.bloomStrokeData') and json.loads(cmds.getAttr(node+'.bloomStrokeData')).get('output')!=2: return False   # tubes: retopology pulls them thinner; their own quads stay
+        faces=cmds.polyEvaluate(node,face=True); name=node.split('|')[-1]; started=time.monotonic()
+        target=self.face_target.value() if self.use_face_target.isChecked() else max(200,min(600,faces*2))   # small targets keep the wait short
+        selected=cmds.ls(selection=True,long=True) or []; work=None; self.quads_busy=True
+        self.status.setText('Making quads for '+name+'…'); QtWidgets.QApplication.processEvents(); cmds.waitCursor(state=True)
+        try:
+            with chunk('Bloom quads on finish'):
+                work=self.retopo_checked(node,target)
+                if work:
+                    old_shapes=cmds.listRelatives(node,shapes=True,noIntermediate=True,fullPath=True) or []
+                    cmds.polySoftEdge(work,angle=60,constructionHistory=False)
+                    for shape in cmds.listRelatives(work,shapes=True,noIntermediate=True,fullPath=True) or []: cmds.rename(cmds.parent(shape,node,shape=True,relative=True)[0],name+'Shape')
+                    cmds.delete(old_shapes); cmds.delete(work)
+                    if not cmds.listConnections(cmds.listRelatives(node,shapes=True,noIntermediate=True,fullPath=True),type='shadingEngine'): cmds.sets(node,edit=True,forceElement='initialShadingGroup')
+            if work: self.status.setText('{}: all quads now • {:,} faces ({:.1f} s). Untick "Quads when a drawing is finished" for instant results.'.format(name,cmds.polyEvaluate(node,face=True),time.monotonic()-started))
+            else: self.status.setText('{} kept as drawn: Maya retopology did not return clean quads for it. Try the Retopology tab with another target.'.format(name))
+            return bool(work)
+        except Exception as error:
+            self.status.setText('Quads: '+str(error)); return False
+        finally:
+            cmds.waitCursor(state=False); self.quads_busy=False
+            with transient():       # keep the selection change off the undo queue: one Ctrl+Z undoes the quads
+                valid=[item for item in selected if cmds.objExists(item)]
+                if valid: cmds.select(valid,replace=True)
+                else: cmds.select(clear=True)
     def apply_face_target(self,node,settings=None):
         # Live tools approximate face counts through density. Native retopology is
         # available only as an explicit action in the Retopology tab.
@@ -1910,7 +1977,7 @@ class BloomPro(QtWidgets.QDialog):
         <p><b>Draw and edit directly. Maya objects update automatically.</b> Drag empty space to draw. Click an existing drawing to select and reshape it. No save/commit button is needed.</p>
         <h3>Tube, Curve and Filled shape</h3><p>Tube makes a round mesh stroke. Curve makes an editable line without faces. Filled shape closes and fills on release. While dragging, previews stay lightweight; the chosen subdivision applies when you release.</p>
         <h3>Brush &amp; tool polygons</h3><p>Path samples and Tube sides control the brush mesh density. Subdivision adds polygons; Roundness controls smoothing. Depth segments controls filled walls. These settings affect the selected drawing and the active brush for your next strokes. Aim for polygon count adjusts sampling or wall density to approach the target; counts are approximate. Curve strokes have control points rather than polygons.</p>
-        <p>Live results are limited to 200,000 faces to keep interaction manageable. Native retopology is an explicit action in its own tab.</p>
+        <p>Live results are limited to 200,000 faces to keep interaction manageable. With <b>Quads when a drawing is finished</b> ticked, filled shapes are rebuilt as all quads about a second after you stop drawing (Maya retopology, 1 to 4 seconds); tubes get quad caps at once. The Retopology tab makes separate copies at any target.</p>
         <h3>Edit and clear</h3><p>Click a 2D drawing to reveal pink handles. Drag a handle to reshape, or drag the outline/interior to move it. Shift-drag starts a stroke over an existing one. Double-click an edge to add a point. Delete removes a point or drawing. Clear Canvas removes this canvas's drawings; Undo restores them. In a 3D view, Clear Canvas removes viewport strokes made by this Studio, preserving unrelated objects.</p>
         <h3>3D and surface drawing</h3><p>Click an object to select it. Move or Edit points uses Maya tools; Q returns to drawing. Alt + mouse navigates. Use selected surface captures a character mesh/group for Tube or Curve projection on its current pose. Clear surface returns to plane drawing. Strokes are separate geometry and are not automatically rigged.</p>
         <h3>Shapes, saving and windows</h3><p>Animals offer heads/full bodies and stylized/natural silhouettes. Shapes are outline starters rather than complete 3D animals. Every finished drawing is kept automatically and saves with your Maya scene. Closing the Studio leaves the finished objects in Maya. Use the title bar or edges to resize; F11 toggles fullscreen.</p>''')
@@ -1974,7 +2041,13 @@ class BloomPro(QtWidgets.QDialog):
             with chunk('Bloom retopology copy'):
                 try:
                     result=cmds.duplicate(source,returnRootsOnly=True,name='bloomRetopo#')[0]; cmds.delete(result,constructionHistory=True)
-                    cmds.polyRetopo(result,targetFaceCount=self.target_faces.value(),preserveHardEdges=self.keep_edges.isChecked()); cmds.select(result)
+                    if cmds.polyEvaluate(result,face=True)<2000:
+                        box=cmds.exactWorldBoundingBox(result); self.even_triangles(result,max(box[3]-box[0],box[4]-box[1],box[5]-box[2],1e-6))
+                    for goal in (self.target_faces.value(),int(self.target_faces.value()*1.6)):
+                        cmds.polyRetopo(result,targetFaceCount=goal,preserveHardEdges=self.keep_edges.isChecked())
+                        if self.quad_share(result)==1: break
+                    else: raise ValueError('Maya returned the mesh without new quads at this target. Change Target quads and try again.')
+                    cmds.delete(result,constructionHistory=True); cmds.select(result)
                 except Exception:
                     if result and cmds.objExists(result): cmds.delete(result)
                     raise
@@ -2026,7 +2099,7 @@ class BloomPro(QtWidgets.QDialog):
                     (self.cup_sides,16 if low else 96),(self.cup_segments,1 if low else 16)]
             for widget,value in values:
                 widget.blockSignals(True); widget.setValue(value); widget.blockSignals(False)
-            self.caps.blockSignals(True); self.caps.setCurrentText('N-gons' if low else 'Triangles'); self.caps.blockSignals(False)
+            self.caps.blockSignals(True); self.caps.setCurrentText('N-gons' if low else 'Quad fan • convex'); self.caps.blockSignals(False)
             self.use_face_target.blockSignals(True); self.use_face_target.setChecked(False); self.use_face_target.blockSignals(False)
         finally:
             self.syncing_settings=False
