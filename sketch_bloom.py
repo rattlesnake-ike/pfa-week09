@@ -379,7 +379,10 @@ def fill_contours(points):
         loop=simplify_path(loop,.01/scale,True)
         if len(loop)>=3: result.append(loop)
     if not result: raise ValueError('This outline has no fillable area. Draw a wider shape.')
-    return result
+    # A sketch that runs past its own start leaves small scraps beside the shape.
+    # Keep the real lobes (a figure 8 keeps both); drop anything under 3% of the largest.
+    areas=[abs(sum(l[i][0]*l[(i+1)%len(l)][1]-l[(i+1)%len(l)][0]*l[i][1] for i in range(len(l)))) for l in result]
+    return [l for l,a in zip(result,areas) if a>=.03*max(areas)]
 
 
 
