@@ -1186,8 +1186,7 @@ class BloomPro(QtWidgets.QDialog):
     def subdivide_shape_copy(self):
         if self.shape_subdivision.value()<1: self.status.setText('Set subdivision to 1 or higher first.'); return
         self.retopo_source=None
-        self.capture_source()
-        if not self.retopo_source: return
+        if not self.obvious_mesh()[0]: self.status.setText('Draw or select a shape first.'); return
         self.refine_levels.setValue(self.shape_subdivision.value()); self.refine_round.setValue(self.shape_roundness.value()); self.refine_copy()
     def choose_stroke(self,index):
         self.canvas.selected=index; self.canvas.active_point=-1; self.canvas.editing=True; self.canvas.finish()
@@ -1538,6 +1537,9 @@ class BloomPro(QtWidgets.QDialog):
                 else: candidates=(cmds.listRelatives(item,allDescendents=True,fullPath=True,type='mesh') or [])+(cmds.listRelatives(item,shapes=True,fullPath=True,type='mesh') or [])
                 for shape in candidates:
                     if not cmds.getAttr(shape+'.intermediateObject') and shape not in shapes: shapes.append(shape)
+            if not shapes:
+                node,_=self.obvious_mesh()
+                if node: shapes=cmds.listRelatives(node,shapes=True,noIntermediate=True,fullPath=True,type='mesh') or []
             if not shapes: raise ValueError('Select the character mesh or its group first.')
             self.paintable_shapes=[cmds.ls(shape,uuid=True)[0] for shape in shapes]; self.live_surface.setChecked(True)
             text='Paintable target: {} mesh surface(s)'.format(len(shapes))
@@ -1598,6 +1600,8 @@ class BloomPro(QtWidgets.QDialog):
             mesh,_=selected_mesh(); text='Selected: {}\n{:,} faces • {:,} vertices'.format(mesh.split('|')[-1],cmds.polyEvaluate(mesh,face=True),cmds.polyEvaluate(mesh,vertex=True))
         except Exception: text='Select a mesh to see its actual face count.'
         for label in self.scene_stats_labels: label.setText(text)
+        try: self.update_source_label()
+        except Exception: pass
     def register_object(self,node):
         ids=cmds.ls(node,uuid=True) or []
         if ids and ids[0] not in self.created_nodes: self.created_nodes.append(ids[0])
@@ -1777,8 +1781,8 @@ class BloomPro(QtWidgets.QDialog):
 
     def build_retopo(self):
         page=QtWidgets.QWidget(); layout=QtWidgets.QVBoxLayout(page)
-        label=QtWidgets.QLabel('Select an existing polygon object in Maya, then capture it below. Retopology and subdivision create separate copies for comparison.'); label.setWordWrap(True); layout.addWidget(label)
-        self.source_label=QtWidgets.QLabel('No source selected'); layout.addWidget(self.source_label); layout.addWidget(self.button('Use Selected Object',self.capture_source))
+        label=QtWidgets.QLabel('Retopology and subdivision work on the object named below and create separate copies for comparison. Select another object in Maya to switch. Use Selected Object keeps one for when nothing is selected.'); label.setWordWrap(True); layout.addWidget(label)
+        self.source_label=QtWidgets.QLabel('Nothing to use yet. Draw something, or select a polygon object in Maya.'); self.source_label.setWordWrap(True); layout.addWidget(self.source_label); layout.addWidget(self.button('Use Selected Object',self.capture_source))
         self.target_faces=self.integer(100,1000000,5000); self.keep_edges=QtWidgets.QCheckBox('Preserve hard edges'); self.keep_edges.setChecked(True)
         self.group(layout,'Automatic retopology',[('Target quads',self.target_faces),('',self.keep_edges),('',self.button('Retopologize Copy',self.retopologize))])
         self.refine_levels=self.integer(1,4,1); self.refine_round=self.number(0,1,0)
@@ -1787,13 +1791,45 @@ class BloomPro(QtWidgets.QDialog):
         hint.setWordWrap(True); layout.addWidget(hint); layout.addWidget(self.button('Open Maya Modeling Toolkit',self.open_toolkit)); layout.addStretch(); self.tabs.addTab(page,'Retopology')
     def capture_source(self):
         try:
-            source,_=selected_mesh(); self.retopo_source=(cmds.ls(source,uuid=True) or [None])[0]; self.source_label.setText(source)
+            source,_=selected_mesh(); self.retopo_source=(cmds.ls(source,uuid=True) or [None])[0]; self.update_source_label()
         except Exception as error: self.status.setText(str(error))
+    def has_mesh(self,node):
+        return bool(node and cmds.objExists(node) and cmds.listRelatives(node,shapes=True,noIntermediate=True,fullPath=True,type='mesh'))
+    def obvious_mesh(self):
+        """The object a step should use when nobody clicked Use Selected Object.
+        Order: the mesh selected in Maya, the object kept with Use Selected Object,
+        the drawing selected on the 2D canvas, then the newest mesh this Studio made.
+        A copy made by Retopologize / Subdivide stands for the object it was made from,
+        so pressing the button twice does not retopologize the copy."""
+        copies=getattr(self,'copy_sources',{})
+        def original(node):
+            for _ in range(8):
+                source=cmds.ls(copies.get((cmds.ls(node,uuid=True) or [''])[0],''),long=True)
+                if not source: break
+                node=source[0]
+            return node
+        try: return original(selected_mesh()[0]),'selected in Maya'
+        except ValueError: pass
+        kept=cmds.ls(self.retopo_source,long=True) if self.retopo_source else []
+        if kept and self.has_mesh(kept[0]): return kept[0],'kept with Use Selected Object'
+        stroke=self.canvas.current()
+        node=self.resolve_live_node(stroke.get('uid')) if stroke else None
+        if self.has_mesh(node): return node,'the drawing selected on the canvas'
+        for uid in reversed(self.created_nodes+list(self.scene_nodes.values())):
+            for node in cmds.ls(uid,long=True) or []:
+                if uid not in copies and self.has_mesh(node): return node,'the last thing you made'
+        return None,''
+    def update_source_label(self):
+        if not hasattr(self,'source_label'): return
+        node,how=self.obvious_mesh()
+        self.source_label.setText('Will use: {}  ({})'.format(node.split('|')[-1],how) if node else 'Nothing to use yet. Draw something, or select a polygon object in Maya.')
     def source_mesh(self):
-        if not self.retopo_source: raise ValueError('Use Selected Object first.')
-        nodes=cmds.ls(self.retopo_source,long=True) or []
-        if not nodes: raise ValueError('The source no longer exists. Select it again.')
-        return nodes[0]
+        node,_=self.obvious_mesh()
+        if not node: raise ValueError('Draw something, or select a polygon object in Maya, first.')
+        return node
+    def remember_copy(self,result,source):
+        if not hasattr(self,'copy_sources'): self.copy_sources={}
+        self.copy_sources[cmds.ls(result,uuid=True)[0]]=cmds.ls(source,uuid=True)[0]
     def retopologize(self):
         result=None
         try:
@@ -1805,9 +1841,10 @@ class BloomPro(QtWidgets.QDialog):
                 except Exception:
                     if result and cmds.objExists(result): cmds.delete(result)
                     raise
-            self.register_object(result)
-            self.status.setText('Retopology copy: {} • {:,} faces. Source kept.'.format(result,cmds.polyEvaluate(result,face=True)))
-        except Exception as error: self.status.setText('Retopology could not run in this Maya installation: '+str(error))
+            self.remember_copy(result,source); self.register_object(result)
+            self.status.setText('Retopology copy: {} • {:,} faces. Source kept: {}.'.format(result,cmds.polyEvaluate(result,face=True),source.split('|')[-1]))
+        except AttributeError as error: self.status.setText('Retopology could not run in this Maya installation: '+str(error))
+        except Exception as error: self.status.setText('Retopology: '+str(error))
         finally: cmds.waitCursor(state=False)
     def refine_copy(self):
         result=None
@@ -1822,8 +1859,8 @@ class BloomPro(QtWidgets.QDialog):
                 except Exception:
                     if result and cmds.objExists(result): cmds.delete(result)
                     raise
-            self.register_object(result)
-            self.status.setText('Created {} • {:,} faces.'.format(result,cmds.polyEvaluate(result,face=True)))
+            self.remember_copy(result,source); self.register_object(result)
+            self.status.setText('Created {} • {:,} faces from {}.'.format(result,cmds.polyEvaluate(result,face=True),source.split('|')[-1]))
         except Exception as error: self.status.setText(str(error))
         finally: cmds.waitCursor(state=False)
     def open_toolkit(self):
