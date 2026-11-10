@@ -719,6 +719,12 @@ class SceneViews(QtWidgets.QWidget):
             global_pos=event.globalPosition().toPoint() if hasattr(event,'globalPosition') else event.globalPos()
             p=widget.mapFromGlobal(global_pos)
             screen=(p.x()*view.portWidth()/max(1,widget.width()),(widget.height()-1-p.y())*view.portHeight()/max(1,widget.height()))
+            if self is getattr(owner,'paint_view',None):
+                if not owner.paint_on: return False
+                if kind==QtCore.QEvent.MouseButtonPress: self.input_active=True; owner.paint_begin()
+                owner.paint_move(view,screen)
+                if kind==QtCore.QEvent.MouseButtonRelease: self.input_active=False; owner.paint_end()
+                event.accept(); return True
             if kind==QtCore.QEvent.MouseButtonPress:
                 cmds.setFocus(panel); cmds.modelEditor(panel,edit=True,activeView=True)
                 if not event.modifiers() & qt.ShiftModifier:
@@ -917,6 +923,21 @@ class LiveStrokeTool:
             if not self.direct_input and not self.owner.keep_drawing.isChecked():
                 QtCore.QTimer.singleShot(0,lambda:self.owner.select_edit(keep_message=True))
 
+PAINT_BRUSHES=['Soft round','Hard round','Airbrush','Marker','Watercolour','Dry brush','Speckle','Eraser']
+
+def brush_weight(kind,d,side=0.0,rnd=0.0):
+    """Brush types (class critique 1:15). How strongly a brush colours one point, 0..1.
+    d is the distance from the middle of the stroke as a share of the radius, side is the
+    signed distance across the stroke (-1..1), rnd is a random number fixed for that point."""
+    if d>=1: return 0.0
+    if kind=='Hard round': return 1.0 if d<.85 else (1-d)/.15
+    if kind=='Airbrush': return .12*math.exp(-4*d*d)                      # builds up as you linger
+    if kind=='Marker': return .8 if d<.9 else 8*(1-d)                      # flat, no build-up
+    if kind=='Watercolour': return .35+.65*max(0.0,min(1.0,(d-.55)/.35))**2 if d<.95 else 20*(1-d)   # pale middle, dark rim
+    if kind=='Dry brush': return 1-d**4 if math.sin(side*19+3*math.sin(side*7))>-.15 and rnd>.18 else 0.0   # streaks along the stroke
+    if kind=='Speckle': return 1.0 if rnd>.45+.5*d else 0.0
+    return (1-d*d)**2                                                      # Soft round, Eraser
+
 class BloomPro(QtWidgets.QDialog):
     def __init__(self,parent):
         super().__init__(parent); self.setObjectName('SketchBloomProWindow'); self.setWindowTitle('Sketch Bloom • Week 09 • Maya')
@@ -958,6 +979,7 @@ class BloomPro(QtWidgets.QDialog):
             view=SceneViews(cameras); self.views.append(view); self.tabs.addTab(view,title)
         self.build_live(); self.build_retopo(); self.build_assembly(); self.build_help(); self.add_view_draw_buttons()
         self.build_primary_tools(root)
+        self.build_paint()
         self.build_week09_controls(root)
         self.apply_bloom_theme()
         self.install_brush_shortcuts()
@@ -1766,6 +1788,121 @@ class BloomPro(QtWidgets.QDialog):
         self.cup_fuse=QtWidgets.QCheckBox('Fuse teacup body and handle'); self.cup_fuse.setChecked(True)
         self.group(layout,'Hollow teacup starter',[('Radius',self.cup_radius),('Height',self.cup_height),('Wall thickness',self.cup_wall),('Bottom thickness',self.cup_base),('Handle reach',self.cup_handle_reach),('Handle radius',self.cup_handle_radius),('Radial segments',self.cup_sides),('Wall segments',self.cup_segments),('',self.cup_fuse),('',self.button('Create Teacup Starter',self.create_cup_starter))])
         note=QtWidgets.QLabel('The starter creates an actual hollow body, then adds a tube handle. You can edit both parts with Maya tools or draw your own handle and fuse it. Intersecting inputs and valid closed surfaces give the most reliable union.'); note.setWordWrap(True); layout.addWidget(note); layout.addStretch(); self.tabs.addTab(page,'Assemble Parts')
+    # ---- Painting tab. The tab shown in class on 11-03 was never pushed to the repo, so
+    # this one is rebuilt from the demo video: vertex colours, painted from the embedded view.
+    def build_paint(self):
+        self.paint_on=False; self.paint_target=None; self.paint_copies={}; self.paint_undo=[]; self.paint_state=None; self.paint_rgb=(.38,.81,.40)
+        page=QtWidgets.QWidget(); row=QtWidgets.QHBoxLayout(page); row.setContentsMargins(4,4,4,4)
+        self.paint_view=SceneViews(['persp']); self.paint_view.studio=self; self.views.append(self.paint_view)
+        self.paint_view.box.itemAt(0).widget().setText('Drag on the object to paint • Alt + mouse orbits • Stop painting returns to selection')
+        row.addWidget(self.paint_view,3)
+        side=QtWidgets.QVBoxLayout(); holder=QtWidgets.QWidget(); holder.setLayout(side); holder.setMaximumWidth(300); row.addWidget(holder,1)
+        self.paint_label=QtWidgets.QLabel('Nothing to paint yet. Draw something first.'); self.paint_label.setWordWrap(True)
+        self.paint_copy=QtWidgets.QCheckBox('Make a painting copy'); self.paint_copy.setChecked(True)
+        self.paint_copy.setToolTip('Paints a denser copy named bloomPaint and hides the drawing, so the drawing stays editable.')
+        self.group(side,'1. Object',[('',self.paint_label),('',self.paint_copy)])
+        self.paint_color_button=QtWidgets.QPushButton(); self.paint_color_button.clicked.connect(lambda checked=False:self.run_action(self.pick_paint_color))
+        self.paint_brush=self.combo(PAINT_BRUSHES); self.paint_radius=self.number(.001,1000,.5); self.paint_opacity=self.number(.05,1,1)
+        self.paint_brush.setToolTip('Soft round: feathered edge. Hard round: crisp edge. Airbrush: builds up while you linger. Marker: flat, no build-up. Watercolour: pale middle, darker rim. Dry brush: streaks along the stroke. Speckle: scattered dots. Eraser: back to the base grey.')
+        self.group(side,'2. Brush',[('',self.paint_color_button),('Brush type',self.paint_brush),('Radius (scene units)',self.paint_radius),('Opacity',self.paint_opacity)])
+        self.paint_toggle=self.button('Start painting',self.toggle_paint); side.addWidget(self.paint_toggle)
+        side.addWidget(self.button('Undo last stroke',self.undo_paint)); side.addWidget(self.button('Fill object with colour',self.fill_paint)); side.addStretch()
+        self.show_paint_color(); self.tabs.insertTab(self.tabs.count()-1,page,'Painting')
+    def show_paint_color(self):
+        color=QtGui.QColor.fromRgbF(*self.paint_rgb); self.paint_color_button.setText('Color '+color.name().upper())
+        self.paint_color_button.setStyleSheet('background:{};color:{};'.format(color.name(),'#000000' if color.lightnessF()>.5 else '#FFFFFF'))
+    def pick_paint_color(self):
+        color=QtWidgets.QColorDialog.getColor(QtGui.QColor.fromRgbF(*self.paint_rgb),self,'Paint colour')
+        if color.isValid(): self.paint_rgb=(color.redF(),color.greenF(),color.blueF()); self.show_paint_color()
+    def toggle_paint(self):
+        if self.paint_on: self.paint_stop()
+        else: self.paint_start()
+    def paint_stop(self):
+        self.paint_on=False; self.paint_toggle.setText('Start painting'); self.status.setText('Painting stopped. Colours are vertex colours: save the Maya scene to keep them.')
+    def paint_start(self):
+        """Picks its own object (critique 1:11, 1:16): no Use selected object click."""
+        node,how=self.obvious_mesh()
+        if not node: raise ValueError('Draw something, or select a polygon object in Maya, first.')
+        uid=cmds.ls(node,uuid=True)[0]; self.live_tool.stop(); self.native_edit=False
+        copy_node=cmds.ls(self.paint_copies.get(uid,''),long=True)
+        if copy_node: node=copy_node[0]
+        elif self.paint_copy.isChecked() and not cmds.objExists(node+'.bloomPaint'):
+            with chunk('Bloom painting copy'):
+                source=node; node=cmds.duplicate(source,returnRootsOnly=True,name='bloomPaint#')[0]; cmds.delete(node,constructionHistory=True)
+                faces=cmds.polyEvaluate(node,face=True); levels=0
+                while faces*4**levels<4000 and levels<4: levels+=1      # enough vertices for a brush to show
+                if levels: cmds.polySmooth(node,divisions=levels,continuity=0,constructionHistory=False,keepBorder=True)
+                cmds.addAttr(node,longName='bloomPaint',attributeType='bool',defaultValue=True); make_editable(node)
+                if not cmds.getAttr(source+'.visibility',lock=True): cmds.setAttr(source+'.visibility',False)
+            self.paint_copies[uid]=cmds.ls(node,uuid=True)[0]; self.register_object(node)
+        shape=cmds.listRelatives(node,shapes=True,noIntermediate=True,fullPath=True,type='mesh')[0]
+        if 'bloomPaint' not in (cmds.polyColorSet(shape,query=True,allColorSets=True) or []):
+            cmds.polyColorSet(shape,create=True,colorSet='bloomPaint',representation='RGB'); cmds.polyColorSet(shape,currentColorSet=True,colorSet='bloomPaint')
+            cmds.polyColorPerVertex(shape,rgb=(.72,.72,.72),colorDisplayOption=True)
+        cmds.polyColorSet(shape,currentColorSet=True,colorSet='bloomPaint'); cmds.setAttr(shape+'.displayColors',True)
+        selection=om.MSelectionList(); selection.add(shape); self.paint_fn=om.MFnMesh(selection.getDagPath(0))
+        self.paint_points=self.paint_fn.getPoints(om.MSpace.kWorld); self.paint_adjacent=[]
+        iterator=om.MItMeshVertex(selection.getDagPath(0))
+        while not iterator.isDone(): self.paint_adjacent.append(list(iterator.getConnectedVertices())); iterator.next()
+        colors=self.paint_fn.getVertexColors('bloomPaint',om.MColor((.72,.72,.72)))
+        self.paint_colors=[(c.r,c.g,c.b) for c in colors]; self.paint_target=cmds.ls(node,uuid=True)[0]; self.paint_undo=[]
+        box=cmds.exactWorldBoundingBox(node)
+        if not getattr(self,'paint_radius_set',False): self.paint_radius.setValue(max(box[3]-box[0],box[4]-box[1],box[5]-box[2])*.06); self.paint_radius_set=True
+        cmds.select(clear=True); self.paint_on=True; self.paint_toggle.setText('Stop painting'); self.paint_view.ensure_ready()
+        self.paint_label.setText('Painting: '+node.split('|')[-1]); self.status.setText('Painting {} ({}) • {:,} vertices. Drag on it in the view.'.format(node.split('|')[-1],how,len(self.paint_colors)))
+    def paint_begin(self):
+        self.paint_state={'start':{},'near':{},'seed':time.time_ns()&0xffff,'last':None,'kind':self.paint_brush.currentText()}
+    def paint_end(self):
+        if self.paint_state and self.paint_state['start']: self.paint_undo.append(self.paint_state['start']); self.paint_undo=self.paint_undo[-30:]
+        self.paint_state=None
+    def paint_move(self,view,screen):
+        self.live_tool.view=view; source,ray=self.live_tool.ray(screen)
+        hit=self.paint_fn.closestIntersection(om.MFloatPoint(source.x,source.y,source.z),om.MFloatVector(ray.x,ray.y,ray.z),om.MSpace.kWorld,1000000.0,False)
+        if hit and hit[2]>=0: self.paint_to(om.MPoint(hit[0]),hit[2])
+    def paint_to(self,point,face):
+        """One step of a stroke: stamps from the last point to this one, a third of a radius apart."""
+        state=self.paint_state; radius=self.paint_radius.value(); last=state['last']
+        if last is None: self.paint_stamp(point,face,om.MVector(0,0,0))
+        else:
+            direction=point-last; length=direction.length()
+            if length<radius*.3: return
+            for step in range(1,int(length/(radius*.3))+1):
+                spot=last+direction*(step*radius*.3/length); near=self.paint_fn.getClosestPoint(spot,om.MSpace.kWorld)
+                self.paint_stamp(om.MPoint(near[0]),near[1],direction)
+            point=last+direction*(int(length/(radius*.3))*radius*.3/length)
+        state['last']=point
+    def paint_stamp(self,center,face,direction):
+        state=self.paint_state; kind=state['kind']; radius=self.paint_radius.value(); opacity=self.paint_opacity.value()
+        colour=(.72,.72,.72) if kind=='Eraser' else self.paint_rgb
+        normal=om.MVector(self.paint_fn.getPolygonNormal(face,om.MSpace.kWorld)); across=direction^normal
+        if across.length()<1e-9: across=normal^om.MVector(0,1,0)
+        if across.length()<1e-9: across=normal^om.MVector(1,0,0)
+        across.normalize(); seen=set(self.paint_fn.getPolygonVertices(face)); frontier=list(seen); ids=[]; values=om.MColorArray()
+        while frontier:
+            vid=frontier.pop(); offset=self.paint_points[vid]-center; d=offset.length()/radius
+            if d>=1: continue
+            for other in self.paint_adjacent[vid]:
+                if other not in seen: seen.add(other); frontier.append(other)
+            base=state['start'].setdefault(vid,self.paint_colors[vid])
+            if kind=='Airbrush': base=self.paint_colors[vid]; weight=opacity*brush_weight(kind,d)
+            else:
+                if state['near'].get(vid,2)<=d: continue          # the stroke already passed closer to this point
+                state['near'][vid]=d; x=(vid*73856093^state['seed']*19349663)&0xffffffff; x^=x>>13; x=(x*1274126177)&0xffffffff
+                weight=opacity*brush_weight(kind,d,(offset*across)/radius,(x&0xffff)/65535.0)
+            new=tuple(base[k]+(colour[k]-base[k])*weight for k in range(3)); self.paint_colors[vid]=new; ids.append(vid); values.append(om.MColor(new))
+        if ids: self.paint_fn.setVertexColors(values,ids); self.paint_fn.updateSurface()
+    def undo_paint(self):
+        if not self.paint_undo: self.status.setText('No paint stroke to undo.'); return
+        start=self.paint_undo.pop(); values=om.MColorArray()
+        for vid,color in start.items(): self.paint_colors[vid]=color; values.append(om.MColor(color))
+        self.paint_fn.setVertexColors(values,list(start)); self.paint_fn.updateSurface(); self.status.setText('Undid one paint stroke.')
+    def fill_paint(self):
+        if not self.paint_on: self.paint_start()
+        self.paint_undo.append({vid:color for vid,color in enumerate(self.paint_colors)}); self.paint_colors=[self.paint_rgb]*len(self.paint_colors)
+        values=om.MColorArray()
+        for color in self.paint_colors: values.append(om.MColor(color))
+        self.paint_fn.setVertexColors(values,list(range(len(self.paint_colors)))); self.paint_fn.updateSurface()
+
     def build_help(self):
         page=QtWidgets.QWidget(); layout=QtWidgets.QVBoxLayout(page); browser=QtWidgets.QTextBrowser()
         browser.setStyleSheet('QTextBrowser {background:#FAF5FF;color:#34234F;border:none;padding:12px;}')
